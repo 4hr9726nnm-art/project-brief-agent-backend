@@ -397,6 +397,51 @@ app.post('/api/upload-by-url', express.json(), async (req, res) => {
     return res.status(500).json({ error: err?.message || 'download failed' });
   }
 });
+// Add near other routes in server.js
+// This middleware must be placed before routes that expect JSON bodies (or define it inline below)
+app.post('/api/upload-raw', express.raw({ type: 'application/pdf', limit: '25mb' }), async (req, res) => {
+  try {
+    // req.body is a Buffer because express.raw was used
+    const buffer = req.body;
+    if (!buffer || buffer.length === 0) {
+      return res.status(400).json({ error: 'Empty request body' });
+    }
+
+    // get headers
+    const originalFileName = req.headers['x-filename'] ? decodeURIComponent(req.headers['x-filename']) : `upload-${Date.now()}.pdf`;
+    const userId = req.headers['x-userid'] ? decodeURIComponent(req.headers['x-userid']) : 'anonymous';
+
+    // Try parsing PDF to extract text (lazy import)
+    let text = '';
+    try {
+      const pdfModule = await import('pdf-parse');
+      const pdfFunc = pdfModule.default || pdfModule;
+      const parsed = await pdfFunc(buffer);
+      text = parsed.text || '';
+    } catch (err) {
+      console.warn('pdf-parse failed on raw upload', err && err.message ? err.message : err);
+      text = '';
+    }
+
+    // upload to S3
+    const s3Key = `uploads/${Date.now()}-${originalFileName.replace(/\s+/g, '_')}`;
+    await new Promise((resolve, reject) => {
+      s3.putObject({ Bucket: process.env.S3_BUCKET, Key: s3Key, Body: buffer }, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+
+    const docId = `doc-${Date.now()}`;
+    docs[docId] = { s3Key, text, uploadedAt: new Date().toISOString(), userId, originalName: originalFileName };
+
+    console.log('/api/upload-raw succeeded for docId', docId);
+    return res.json({ ok: true, docId, hasText: !!text });
+  } catch (err) {
+    console.error('/api/upload-raw error', err && (err.stack || err.message) ? (err.stack || err.message) : err);
+    return res.status(500).json({ error: err?.message || 'upload-raw failed' });
+  }
+});
 
 // Start server
 const port = process.env.PORT || 3000;
