@@ -19,7 +19,7 @@ const users = {};  // userId -> { credits: number, email }
 AWS.config.update({
   accessKeyId: process.env.AWS_ACCESS_KEY_ID,
   secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
-  region: process.env.S3_REGION || 'us-east-1'
+  region: process.env.S3_REGION || 'eu-north-1'
 });
 const s3 = new AWS.S3();
 
