@@ -1,4 +1,4 @@
-// server.js - Quick MVP with PayPal
+// server.js - Quick MVP with fetch-based PayPal (no SDK)
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
@@ -6,7 +6,6 @@ import pdf from 'pdf-parse';
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 import fetch from 'node-fetch';
-import paypal from '@paypal/checkout-server-sdk';
 dotenv.config();
 
 const app = express();
@@ -24,17 +23,94 @@ AWS.config.update({
 });
 const s3 = new AWS.S3();
 
-// ---------- PayPal Setup ----------
-const environment = process.env.PAYPAL_MODE === 'live'
-  ? new paypal.core.LiveEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_CLIENT_SECRET)
-  : new paypal.core.SandboxEnvironment(process.env.PAYPAL_CLIENT_ID, process.env.PAYPAL_CLIENT_SECRET);
-const paypalClient = new paypal.core.PayPalHttpClient(environment);
-
 // ---------- OpenAI Setup ----------
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 // ---------- Multer ----------
 const upload = multer({ dest: '/tmp' });
+
+// ---------- PayPal (fetch-based) helper ----------
+const PAYPAL_BASE = (process.env.PAYPAL_MODE === 'live')
+  ? 'https://api-m.paypal.com'
+  : 'https://api-m.sandbox.paypal.com';
+
+// Get OAuth2 access token from PayPal
+async function getPayPalAccessToken() {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const secret = process.env.PAYPAL_CLIENT_SECRET;
+  if (!clientId || !secret) throw new Error('PayPal credentials missing in env');
+
+  const basicAuth = Buffer.from(`${clientId}:${secret}`).toString('base64');
+
+  const resp = await fetch(`${PAYPAL_BASE}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${basicAuth}`,
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    body: 'grant_type=client_credentials'
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`PayPal token error: ${resp.status} ${txt}`);
+  }
+  const data = await resp.json();
+  return data.access_token;
+}
+
+// Create an order (returns { id, approvalUrl })
+async function createPayPalOrder({ amount = '15.00', description = 'Project Brief Analyzer - 50 credits', userId = 'anonymous' } = {}) {
+  const token = await getPayPalAccessToken();
+  const body = {
+    intent: 'CAPTURE',
+    purchase_units: [{
+      amount: { currency_code: 'USD', value: amount },
+      description,
+      custom_id: userId
+    }],
+    application_context: {
+      return_url: `${process.env.BASE_URL}/api/capture-paypal-order`, // PayPal redirects here with token param
+      cancel_url: `${process.env.BASE_URL}/paypal-cancel`
+    }
+  };
+
+  const resp = await fetch(`${PAYPAL_BASE}/v2/checkout/orders`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`PayPal create order failed: ${resp.status} ${txt}`);
+  }
+  const data = await resp.json();
+  const approvalUrl = (data.links || []).find(l => l.rel === 'approve')?.href || null;
+  return { id: data.id, approvalUrl };
+}
+
+// Capture order (after approval)
+async function capturePayPalOrder(orderId) {
+  const token = await getPayPalAccessToken();
+  const resp = await fetch(`${PAYPAL_BASE}/v2/checkout/orders/${orderId}/capture`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    }
+  });
+
+  if (!resp.ok) {
+    const txt = await resp.text();
+    throw new Error(`PayPal capture failed: ${resp.status} ${txt}`);
+  }
+  const data = await resp.json();
+  return data;
+}
 
 // Utility: upload local file to S3
 function uploadToS3(localPath, s3Key) {
@@ -90,74 +166,55 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// Create PayPal order (checkout)
+// Create PayPal order (checkout) - returns approval url
 app.post('/api/create-paypal-order', async (req, res) => {
   try {
-    const { userId, amount = '15.00', description = 'Project Brief Analyzer - 50 credits' } = req.body;
-    const request = new paypal.orders.OrdersCreateRequest();
-    request.prefer("return=representation");
-    request.requestBody({
-      intent: 'CAPTURE',
-      purchase_units: [{
-        amount: { currency_code: 'USD', value: amount },
-        description,
-        custom_id: userId || 'anonymous'
-      }],
-      application_context: {
-        return_url: `${process.env.BASE_URL}/paypal-success`,
-        cancel_url: `${process.env.BASE_URL}/paypal-cancel`
-      }
-    });
-
-    const order = await paypalClient.execute(request);
-    const approvalUrl = order.result.links.find(l => l.rel === 'approve')?.href;
-    res.json({ id: order.result.id, approvalUrl });
+    const { userId, amount = '15.00', description = 'Project Brief Analyzer - 50 credits' } = req.body || {};
+    const order = await createPayPalOrder({ amount, description, userId });
+    res.json({ id: order.id, approvalUrl: order.approvalUrl });
   } catch (err) {
     console.error('PayPal create order error', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Capture PayPal order after user approves (GET redirect endpoint)
+// Capture PayPal order after user approves (PayPal will redirect to return_url with token=ORDERID)
 app.get('/api/capture-paypal-order', async (req, res) => {
   try {
-    const { token } = req.query; // PayPal returns token param
+    const token = req.query.token || req.query.orderId || null;
     if (!token) return res.status(400).send('Missing token');
+    // token is the order ID to capture
+    const captureData = await capturePayPalOrder(token);
 
-    const request = new paypal.orders.OrdersCaptureRequest(token);
-    request.requestBody({});
-    const capture = await paypalClient.execute(request);
-    const order = capture.result;
-    const customId = order.purchase_units?.[0]?.custom_id || 'anonymous';
+    // Extract custom_id (userId) and amount from captureData
+    const purchaseUnit = (captureData.purchase_units && captureData.purchase_units[0]) || null;
+    const customId = purchaseUnit?.custom_id || 'anonymous';
+    const capture = purchaseUnit?.payments?.captures?.[0] || null;
+    const amount = capture?.amount?.value || '15.00';
 
-    // Grant credits (example: $15 -> 50 credits)
-    const amount = order.purchase_units[0].payments.captures[0].amount.value;
+    // Compute credits (example: $15 -> 50 credits)
     const creditsToAdd = Math.round((parseFloat(amount) / 15) * 50) || 50;
-
     users[customId] = users[customId] || { credits: 0 };
     users[customId].credits += creditsToAdd;
 
     console.log(`PayPal payment captured for ${customId}. Added credits: ${creditsToAdd}`);
 
-    // Redirect to a success page on your frontend or show a simple success text
-    return res.redirect(`${process.env.BASE_URL}/paypal-success?userId=${customId}&credits=${users[customId].credits}`);
+    // Redirect to a success page on your frontend (or return JSON)
+    const redirectTo = `${process.env.BASE_URL}/paypal-success?userId=${customId}&credits=${users[customId].credits}`;
+    return res.redirect(redirectTo);
   } catch (err) {
     console.error('PayPal capture error', err);
-    return res.status(500).send('Capture failed');
+    return res.status(500).send('Capture failed: ' + err.message);
   }
 });
 
-// PayPal webhook (optional, recommended for reliability)
+// PayPal webhook (optional) - logs events. For production, verify signatures.
 app.post('/paypal-webhook', express.json(), (req, res) => {
   try {
     const event = req.body;
-    // Example: if event.resource contains capture details
-    if (event.event_type === 'PAYMENT.CAPTURE.COMPLETED' || event.event_type === 'PAYMENT.CAPTURE.DENIED') {
-      const customId = event.resource?.custom_id || event.resource?.invoice_id || 'unknown';
-      console.log('PayPal webhook event for', customId, event.event_type);
-      // Mark or add credits here if you prefer webhooks
-      // NOTE: in sandbox, structure may differ; log event to inspect.
-    }
+    console.log('PayPal webhook event:', JSON.stringify(event, null, 2));
+    // You can inspect event.resource and event.event_type and credit users if you want to rely on webhooks
+    // NOTE: For production, verify webhook signatures with PayPal; this simple log is for testing only.
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error', err);
