@@ -10,6 +10,16 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+// allow CORS for Wix (or restrict to your exact Wix domain in production)
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // ok for testing; restrict later to your Wix domain
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
+
+
 // In-memory stores (swap with DB in production)
 const docs = {};   // docId -> { s3Key, text, uploadedAt, userId }
 const users = {};  // userId -> { credits: number, email }
