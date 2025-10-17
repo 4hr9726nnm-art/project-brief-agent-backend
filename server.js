@@ -1,9 +1,8 @@
-// server.js - Cleaned Quick MVP (no startup file reads)
+// server.js - Cleaned Quick MVP with lazy pdf-parse import
 // Uses global fetch (Node 18+). PayPal via REST (fetch).
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
-import pdf from 'pdf-parse';
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
 dotenv.config();
@@ -130,7 +129,7 @@ function uploadToS3(localPath, s3Key) {
 // Health
 app.get('/', (req, res) => res.send('Project Brief Agent Backend is running'));
 
-// Upload PDF
+// Upload PDF (lazy import of pdf-parse to avoid module load side-effects)
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
     const filePath = req.file.path;
@@ -140,10 +139,13 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const s3Key = `uploads/${Date.now()}-${fileName}`;
     const data = await fs.promises.readFile(filePath);
 
-    // Extract text using pdf-parse only when someone uploads
+    // Lazy-import pdf-parse here so any side effects inside the pdf-parse module don't run at startup
     let text = '';
     try {
-      const parsed = await pdf(data);
+      const pdfModule = await import('pdf-parse'); // dynamic import returns module namespace
+      // pdf-parse exports a default function in some builds; handle both
+      const pdfFunc = pdfModule.default || pdfModule;
+      const parsed = await pdfFunc(data);
       text = parsed.text || '';
     } catch (err) {
       text = '';
