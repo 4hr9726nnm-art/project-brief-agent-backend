@@ -1,11 +1,11 @@
-// server.js - Quick MVP with fetch-based PayPal (no SDK)
+// server.js - Cleaned Quick MVP (no startup file reads)
+// Uses global fetch (Node 18+). PayPal via REST (fetch).
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
 import pdf from 'pdf-parse';
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
-
 dotenv.config();
 
 const app = express();
@@ -70,7 +70,7 @@ async function createPayPalOrder({ amount = '15.00', description = 'Project Brie
       custom_id: userId
     }],
     application_context: {
-      return_url: `${process.env.BASE_URL}/api/capture-paypal-order`, // PayPal redirects here with token param
+      return_url: `${process.env.BASE_URL}/api/capture-paypal-order`,
       cancel_url: `${process.env.BASE_URL}/paypal-cancel`
     }
   };
@@ -140,13 +140,14 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const s3Key = `uploads/${Date.now()}-${fileName}`;
     const data = await fs.promises.readFile(filePath);
 
-    // Try text extraction via pdf-parse
+    // Extract text using pdf-parse only when someone uploads
     let text = '';
     try {
       const parsed = await pdf(data);
       text = parsed.text || '';
     } catch (err) {
       text = '';
+      console.warn('pdf-parse extraction failed for uploaded file (may be scanned PDF)', err?.message || err);
     }
 
     // Upload to S3
@@ -178,7 +179,7 @@ app.post('/api/create-paypal-order', async (req, res) => {
   }
 });
 
-// Capture PayPal order after user approves (PayPal will redirect to return_url with token=ORDERID)
+// Capture PayPal order after user approves (PayPal will redirect to return_url with token param)
 app.get('/api/capture-paypal-order', async (req, res) => {
   try {
     const token = req.query.token || req.query.orderId || null;
@@ -213,8 +214,6 @@ app.post('/paypal-webhook', express.json(), (req, res) => {
   try {
     const event = req.body;
     console.log('PayPal webhook event:', JSON.stringify(event, null, 2));
-    // You can inspect event.resource and event.event_type and credit users if you want to rely on webhooks
-    // NOTE: For production, verify webhook signatures with PayPal; this simple log is for testing only.
     res.sendStatus(200);
   } catch (err) {
     console.error('Webhook error', err);
