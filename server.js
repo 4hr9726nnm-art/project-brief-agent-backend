@@ -5,7 +5,7 @@ import fs from 'fs';
 import pdf from 'pdf-parse';
 import AWS from 'aws-sdk';
 import dotenv from 'dotenv';
-import fetch from 'node-fetch';
+
 dotenv.config();
 
 const app = express();
