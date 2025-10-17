@@ -310,6 +310,52 @@ app.get('/api/user-credits', (req, res) => {
   res.json({ userId, credits: c });
 });
 
+// server.js - new endpoint to accept a Wix file URL and process it server-side
+app.post('/api/upload-by-url', express.json(), async (req, res) => {
+  try {
+    const { fileUrl, userId, originalFileName } = req.body || {};
+    if (!fileUrl) return res.status(400).json({ error: 'fileUrl missing' });
+
+    // 1) download the file server-side (Render can fetch the Wix media URL)
+    const resp = await fetch(fileUrl);
+    if (!resp.ok) {
+      const txt = await resp.text().catch(()=>'<no-body>');
+      return res.status(502).json({ error: `Failed to download file: ${resp.status} ${txt}` });
+    }
+    const arrayBuffer = await resp.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    // 2) try pdf-parse (lazy import pattern if used earlier)
+    let text = '';
+    try {
+      const pdfModule = await import('pdf-parse');
+      const pdfFunc = pdfModule.default || pdfModule;
+      const parsed = await pdfFunc(buffer);
+      text = parsed.text || '';
+    } catch (err) {
+      console.warn('pdf-parse failed on downloaded file', err?.message || err);
+    }
+
+    // 3) upload to S3 (reuse uploadToS3 helper)
+    const s3Key = `uploads/${Date.now()}-${originalFileName || 'file.pdf'}`;
+    await new Promise((resolve, reject) => {
+      s3.putObject({ Bucket: process.env.S3_BUCKET, Key: s3Key, Body: buffer }, (err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+
+    // 4) create doc record (in-memory)
+    const docId = `doc-${Date.now()}`;
+    docs[docId] = { s3Key, text, uploadedAt: new Date().toISOString(), userId: userId || 'anonymous', originalName: originalFileName || 'file.pdf' };
+
+    return res.json({ ok: true, docId, hasText: !!text });
+  } catch (err) {
+    console.error('/api/upload-by-url error', err);
+    return res.status(500).json({ error: err.message || 'download failed' });
+  }
+});
+
 // Start server
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Server listening on ${port}`));
