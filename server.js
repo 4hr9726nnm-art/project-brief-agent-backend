@@ -1,5 +1,5 @@
-// server.js - Cleaned Quick MVP with lazy pdf-parse import
-// Uses global fetch (Node 18+). PayPal via REST (fetch).
+// server.js - Full patched file
+// Cleaned Quick MVP with lazy pdf-parse import and improved upload-by-url handler
 import express from 'express';
 import multer from 'multer';
 import fs from 'fs';
@@ -19,6 +19,11 @@ app.use((req, res, next) => {
   next();
 });
 
+// Small startup checks to surface missing env variables early
+const requiredEnvs = ['OPENAI_API_KEY', 'S3_BUCKET', 'S3_REGION', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'BASE_URL'];
+requiredEnvs.forEach(k => {
+  if (!process.env[k]) console.warn(`Warning: environment variable ${k} is not set.`);
+});
 
 // In-memory stores (swap with DB in production)
 const docs = {};   // docId -> { s3Key, text, uploadedAt, userId }
@@ -36,7 +41,7 @@ const s3 = new AWS.S3();
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 
 // ---------- Multer ----------
-const upload = multer({ dest: '/tmp' });
+const upload = multer({ dest: '/tmp' }); // keeps current disk flow; ok for Render ephemeral fs
 
 // ---------- PayPal (fetch-based) helper ----------
 const PAYPAL_BASE = (process.env.PAYPAL_MODE === 'live')
@@ -142,8 +147,10 @@ app.get('/', (req, res) => res.send('Project Brief Agent Backend is running'));
 // Upload PDF (lazy import of pdf-parse to avoid module load side-effects)
 app.post('/api/upload', upload.single('file'), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: 'No file provided' });
+
     const filePath = req.file.path;
-    const fileName = req.file.originalname;
+    const fileName = req.file.originalname || req.file.filename || 'upload.pdf';
     const userId = req.body.userId || 'anonymous';
 
     const s3Key = `uploads/${Date.now()}-${fileName}`;
@@ -153,7 +160,6 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     let text = '';
     try {
       const pdfModule = await import('pdf-parse'); // dynamic import returns module namespace
-      // pdf-parse exports a default function in some builds; handle both
       const pdfFunc = pdfModule.default || pdfModule;
       const parsed = await pdfFunc(data);
       text = parsed.text || '';
@@ -174,8 +180,8 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
 
     res.json({ ok: true, docId, hasText: !!text });
   } catch (err) {
-    console.error('Upload error', err);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error('Upload error', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: 'Upload failed', details: err?.message || String(err) });
   }
 });
 
@@ -186,8 +192,8 @@ app.post('/api/create-paypal-order', async (req, res) => {
     const order = await createPayPalOrder({ amount, description, userId });
     res.json({ id: order.id, approvalUrl: order.approvalUrl });
   } catch (err) {
-    console.error('PayPal create order error', err);
-    res.status(500).json({ error: err.message });
+    console.error('PayPal create order error', err && err.stack ? err.stack : err);
+    res.status(500).json({ error: err.message || 'PayPal create failed' });
   }
 });
 
@@ -216,8 +222,8 @@ app.get('/api/capture-paypal-order', async (req, res) => {
     const redirectTo = `${process.env.BASE_URL}/paypal-success?userId=${customId}&credits=${users[customId].credits}`;
     return res.redirect(redirectTo);
   } catch (err) {
-    console.error('PayPal capture error', err);
-    return res.status(500).send('Capture failed: ' + err.message);
+    console.error('PayPal capture error', err && err.stack ? err.stack : err);
+    return res.status(500).send('Capture failed: ' + (err?.message || String(err)));
   }
 });
 
@@ -228,7 +234,7 @@ app.post('/paypal-webhook', express.json(), (req, res) => {
     console.log('PayPal webhook event:', JSON.stringify(event, null, 2));
     res.sendStatus(200);
   } catch (err) {
-    console.error('Webhook error', err);
+    console.error('Webhook error', err && err.stack ? err.stack : err);
     res.sendStatus(500);
   }
 });
@@ -298,7 +304,7 @@ If info is missing, explicitly say what is missing. Return valid JSON only.`;
 
     res.json({ ok: true, docId, result: parsed, remainingCredits: users[uid].credits });
   } catch (err) {
-    console.error('Analyze error', err);
+    console.error('Analyze error', err && err.stack ? err.stack : err);
     res.status(500).json({ error: err.message || 'Analyze failed' });
   }
 });
@@ -310,22 +316,50 @@ app.get('/api/user-credits', (req, res) => {
   res.json({ userId, credits: c });
 });
 
-// server.js - new endpoint to accept a Wix file URL and process it server-side
+// ----------------- /api/upload-by-url (improved) -----------------
 app.post('/api/upload-by-url', express.json(), async (req, res) => {
   try {
     const { fileUrl, userId, originalFileName } = req.body || {};
-    if (!fileUrl) return res.status(400).json({ error: 'fileUrl missing' });
+    if (!fileUrl) return res.status(400).json({ error: 'fileUrl missing in request body' });
 
-    // 1) download the file server-side (Render can fetch the Wix media URL)
-    const resp = await fetch(fileUrl);
-    if (!resp.ok) {
-      const txt = await resp.text().catch(()=>'<no-body>');
-      return res.status(502).json({ error: `Failed to download file: ${resp.status} ${txt}` });
+    // Quick guard: wix internal doc scheme cannot be fetched from server
+    if (typeof fileUrl === 'string' && fileUrl.startsWith('wix:document://')) {
+      console.warn('Received wix:document URL from client; cannot download from server:', fileUrl);
+      return res.status(400).json({
+        error: 'Unfetchable file URL provided. Use Wix File Upload (Upload Button) which returns a public https://static.wixstatic.com URL, or convert the document to a public URL before sending.'
+      });
     }
+
+    // Log incoming request briefly
+    console.log('/api/upload-by-url starting download:', fileUrl, 'userId:', userId, 'origName:', originalFileName);
+
+    let resp;
+    try {
+      // Optionally add a User-Agent; some hosts require it
+      resp = await fetch(fileUrl, { headers: { 'User-Agent': 'ProjectBriefAgent/1.0 (+https://your-domain.example)' } });
+    } catch (err) {
+      console.error('/api/upload-by-url fetch threw', err && err.message ? err.message : err);
+      return res.status(502).json({ error: 'fetch threw an exception', details: String(err?.message || err) });
+    }
+
+    if (!resp.ok) {
+      // try to read a small portion of the body for useful debugging (avoid huge returns)
+      let bodyText = '<no-body>';
+      try {
+        const txt = await resp.text();
+        bodyText = txt ? (txt.length > 1000 ? txt.slice(0,1000) + '...[truncated]' : txt) : '<empty>';
+      } catch (e) {
+        bodyText = `<failed-to-read-body: ${String(e?.message || e)}>`;
+      }
+      console.error(`/api/upload-by-url download failed: status=${resp.status} ${resp.statusText} body=${bodyText}`);
+      return res.status(502).json({ error: `Failed to download file: ${resp.status} ${resp.statusText}`, bodySnippet: bodyText });
+    }
+
+    // read into buffer
     const arrayBuffer = await resp.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
 
-    // 2) try pdf-parse (lazy import pattern if used earlier)
+    // Try pdf parsing (lazy import)
     let text = '';
     try {
       const pdfModule = await import('pdf-parse');
@@ -334,10 +368,11 @@ app.post('/api/upload-by-url', express.json(), async (req, res) => {
       text = parsed.text || '';
     } catch (err) {
       console.warn('pdf-parse failed on downloaded file', err?.message || err);
+      text = '';
     }
 
-    // 3) upload to S3 (reuse uploadToS3 helper)
-    const s3Key = `uploads/${Date.now()}-${originalFileName || 'file.pdf'}`;
+    // Upload buffer to S3
+    const s3Key = `uploads/${Date.now()}-${(originalFileName || 'file.pdf').replace(/\s+/g, '_')}`;
     await new Promise((resolve, reject) => {
       s3.putObject({ Bucket: process.env.S3_BUCKET, Key: s3Key, Body: buffer }, (err) => {
         if (err) return reject(err);
@@ -345,14 +380,21 @@ app.post('/api/upload-by-url', express.json(), async (req, res) => {
       });
     });
 
-    // 4) create doc record (in-memory)
+    // create doc record
     const docId = `doc-${Date.now()}`;
-    docs[docId] = { s3Key, text, uploadedAt: new Date().toISOString(), userId: userId || 'anonymous', originalName: originalFileName || 'file.pdf' };
+    docs[docId] = {
+      s3Key,
+      text,
+      uploadedAt: new Date().toISOString(),
+      userId: userId || 'anonymous',
+      originalName: originalFileName || 'file.pdf'
+    };
 
+    console.log('/api/upload-by-url succeeded for docId', docId, 's3Key', s3Key, 'hasText', !!text);
     return res.json({ ok: true, docId, hasText: !!text });
   } catch (err) {
-    console.error('/api/upload-by-url error', err);
-    return res.status(500).json({ error: err.message || 'download failed' });
+    console.error('/api/upload-by-url ERROR', err && err.stack ? err.stack : err);
+    return res.status(500).json({ error: err?.message || 'download failed' });
   }
 });
 
